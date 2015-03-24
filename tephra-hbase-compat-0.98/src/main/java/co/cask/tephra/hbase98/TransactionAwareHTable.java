@@ -87,7 +87,7 @@ public class TransactionAwareHTable implements HTableInterface, TransactionAware
    * Create a transactional aware instance of the passed HTable
    *
    * @param hTable underlying HBase table to use
-   * @param conflictLevel level of conflict detection to perform
+   * @param conflictLevel level of conflict detection to perform (defaults to {@code COLUMN})
    */
   public TransactionAwareHTable(HTableInterface hTable, TxConstants.ConflictDetection conflictLevel) {
     this(hTable, conflictLevel, false);
@@ -108,7 +108,7 @@ public class TransactionAwareHTable implements HTableInterface, TransactionAware
    * Create a transactional aware instance of the passed HTable, with the option
    * of allowing non-transactional operations.
    * @param hTable underlying HBase table to use
-   * @param conflictLevel level of conflict detection to perform
+   * @param conflictLevel level of conflict detection to perform (defaults to {@code COLUMN})
    * @param allowNonTransactional if true, additional operations (checkAndPut, increment, checkAndDelete)
    *                              will be available, though non-transactional
    */
@@ -474,22 +474,25 @@ public class TransactionAwareHTable implements HTableInterface, TransactionAware
   @Override
   public Collection<byte[]> getTxChanges() {
     Collection<byte[]> txChanges = new TreeSet<byte[]>(Bytes.BYTES_COMPARATOR);
+    for (ActionChange change : changeSet) {
+      txChanges.add(getChangeKey(change.getRow(), change.getFamily(), change.getQualifier()));
+    }
+    return txChanges;
+  }
+
+  public byte[] getChangeKey(byte[] row, byte[] family, byte[] qualifier) {
+    byte[] key;
     switch (conflictLevel) {
       case ROW:
-        for (ActionChange change : changeSet) {
-          txChanges.add(Bytes.add(getTableName(), change.getRow()));
-        }
+        key = Bytes.add(getTableName(), row);
         break;
       case COLUMN:
-        for (ActionChange change : changeSet) {
-          txChanges.add(Bytes.add(getTableName(), change.getRow(),
-              Bytes.add(change.getFamily(), change.getQualifier())));
-        }
+        key = Bytes.add(getTableName(), row, Bytes.add(family, qualifier));
         break;
       default:
         throw new IllegalStateException("Unknown conflict detection level: " + conflictLevel);
     }
-    return txChanges;
+    return key;
   }
 
   @Override
@@ -513,14 +516,21 @@ public class TransactionAwareHTable implements HTableInterface, TransactionAware
         byte[] family = change.getFamily();
         byte[] qualifier = change.getQualifier();
         long transactionTimestamp = tx.getWritePointer();
-        Delete rollbackDelete = new Delete(row, transactionTimestamp);
-        // row delete is sufficient for row-level conflict detection
-        if (conflictLevel == TxConstants.ConflictDetection.COLUMN) {
-          if (family != null && qualifier == null) {
-            rollbackDelete.deleteFamily(family, transactionTimestamp);
-          } else if (family != null && qualifier != null) {
-            rollbackDelete.deleteColumn(family, qualifier, transactionTimestamp);
-          }
+        Delete rollbackDelete = new Delete(row);
+        switch (conflictLevel) {
+          case ROW:
+            // issue family delete for the tx write pointer
+            rollbackDelete.deleteFamilyVersion(change.getFamily(), transactionTimestamp);
+            break;
+          case COLUMN:
+            if (family != null && qualifier == null) {
+              rollbackDelete.deleteFamilyVersion(family, transactionTimestamp);
+            } else if (family != null && qualifier != null) {
+              rollbackDelete.deleteColumn(family, qualifier, transactionTimestamp);
+            }
+            break;
+          default:
+            throw new IllegalStateException("Unknown conflict detection level: " + conflictLevel);
         }
         rollbackDeletes.add(rollbackDelete);
       }
@@ -551,8 +561,8 @@ public class TransactionAwareHTable implements HTableInterface, TransactionAware
     private final byte[] family;
     private final byte[] qualifier;
 
-    private ActionChange(byte[] row) {
-      this(row, null, null);
+    private ActionChange(byte[] row, byte[] family) {
+      this(row, family, null);
     }
 
     private ActionChange(byte[] row, byte[] family, byte[] qualifier) {
@@ -599,7 +609,9 @@ public class TransactionAwareHTable implements HTableInterface, TransactionAware
   private void addToChangeSet(byte[] row, byte[] family, byte[] qualifier) {
     switch (conflictLevel) {
       case ROW:
-        changeSet.add(new ActionChange(row));
+        // even with row-level conflict detection, we need to track changes per-family, since this
+        // is the granularity at which we will issue deletes for rollback
+        changeSet.add(new ActionChange(row, family));
         break;
       case COLUMN:
         changeSet.add(new ActionChange(row, family, qualifier));
